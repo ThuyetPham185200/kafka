@@ -13,28 +13,20 @@ type KafkaInterface interface {
 	Open() error
 	Close() error
 }
-
-// ===== Config Structs =====
-type KafkaProducerConfig struct {
+type KafkaConfig struct {
 	BootstrapServers string
 	Topic            string
-}
-
-type KafkaConsumerConfig struct {
-	BootstrapServers string
-	Topic            string
-	GroupID          string
-	AutoOffsetReset  string
+	ExtraConfig      map[string]string
 }
 
 // ===== Producer Implementation =====
 type KafkaProducer struct {
 	producer *kafka.Producer
-	config   KafkaProducerConfig
+	config   KafkaConfig
 }
 
 func (p *KafkaProducer) Init(config any) error {
-	cfg, ok := config.(KafkaProducerConfig)
+	cfg, ok := config.(KafkaConfig)
 	if !ok {
 		return fmt.Errorf("invalid config type for producer")
 	}
@@ -46,11 +38,23 @@ func (p *KafkaProducer) Init(config any) error {
 }
 
 func (p *KafkaProducer) Open() error {
-	prod, err := kafka.NewProducer(&kafka.ConfigMap{
+	configMap := &kafka.ConfigMap{
 		"bootstrap.servers": p.config.BootstrapServers,
-	})
+	}
+
+	// Merge extra configs if provided
+	fmt.Printf("Kafka producer configuration:\n")
+	for key, value := range p.config.ExtraConfig {
+		if err := configMap.SetKey(key, value); err != nil {
+			fmt.Printf("Warning: failed to set extra config %s=%s: %v\n", key, value, err)
+		} else {
+			fmt.Printf("     %s : %s\n", key, value)
+		}
+	}
+
+	prod, err := kafka.NewProducer(configMap)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create producer: %w", err)
 	}
 	p.producer = prod
 	fmt.Println("Kafka producer opened")
@@ -84,33 +88,73 @@ func (p *KafkaProducer) SendMsg(data []byte) error {
 	return nil
 }
 
+// SendMsg sends a raw []byte message to Kafka and waits for delivery confirmation
+func (p *KafkaProducer) Push(data []byte) error {
+	if p.producer == nil {
+		return fmt.Errorf("producer not initialized or opened")
+	}
+
+	deliveryChan := make(chan kafka.Event, 1)
+
+	err := p.producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &p.config.Topic, Partition: kafka.PartitionAny},
+		Value:          data,
+	}, deliveryChan)
+
+	if err != nil {
+		close(deliveryChan)
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	// Wait for delivery report
+	e := <-deliveryChan
+	m := e.(*kafka.Message)
+	close(deliveryChan)
+
+	if m.TopicPartition.Error != nil {
+		return fmt.Errorf("delivery failed: %v", m.TopicPartition.Error)
+	}
+
+	fmt.Printf("Delivered message to topic %s [%d] at offset %v\n",
+		*m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset)
+
+	return nil
+}
+
 // ===== Consumer Implementation =====
 type KafkaConsumer struct {
 	consumer *kafka.Consumer
-	config   KafkaConsumerConfig
+	config   KafkaConfig
 }
 
 func (c *KafkaConsumer) Init(config any) error {
-	cfg, ok := config.(KafkaConsumerConfig)
+	cfg, ok := config.(KafkaConfig)
 	if !ok {
 		return fmt.Errorf("invalid config type for consumer")
 	}
-	if cfg.BootstrapServers == "" || cfg.Topic == "" || cfg.GroupID == "" {
+	if cfg.BootstrapServers == "" || cfg.Topic == "" {
 		return fmt.Errorf("missing required consumer config fields")
-	}
-	if cfg.AutoOffsetReset == "" {
-		cfg.AutoOffsetReset = "earliest"
 	}
 	c.config = cfg
 	return nil
 }
 
 func (c *KafkaConsumer) Open() error {
-	cons, err := kafka.NewConsumer(&kafka.ConfigMap{
+
+	configMap := &kafka.ConfigMap{
 		"bootstrap.servers": c.config.BootstrapServers,
-		"group.id":          c.config.GroupID,
-		"auto.offset.reset": c.config.AutoOffsetReset,
-	})
+	}
+
+	fmt.Printf("Kafka consumer configuration:\n")
+	for key, value := range c.config.ExtraConfig {
+		if err := configMap.SetKey(key, value); err != nil {
+			fmt.Printf("Warning: failed to set extra config %s=%s: %v\n", key, value, err)
+		} else {
+			fmt.Printf("     %s : %s\n", key, value)
+		}
+	}
+
+	cons, err := kafka.NewConsumer(configMap)
 	if err != nil {
 		return err
 	}
@@ -120,8 +164,7 @@ func (c *KafkaConsumer) Open() error {
 	}
 
 	c.consumer = cons
-	fmt.Printf("Kafka consumer opened (group=%s) subscribed to: %s\n",
-		c.config.GroupID, c.config.Topic)
+	fmt.Printf("Kafka consumer subscribed to: %s\n", c.config.Topic)
 	return nil
 }
 
@@ -151,4 +194,27 @@ func (c *KafkaConsumer) ReadMsg(timeout time.Duration) ([]byte, error) {
 		msg.TopicPartition.Partition, msg.TopicPartition.Offset, string(msg.Value))
 
 	return msg.Value, nil
+}
+
+func (c *KafkaConsumer) Poll(timeout time.Duration) ([]byte, error) {
+	if c.consumer == nil {
+		return nil, fmt.Errorf("consumer not initialized or opened")
+	}
+
+	ev := c.consumer.Poll(int(timeout.Milliseconds()))
+	if ev == nil {
+		return nil, nil // no new messages
+	}
+
+	switch e := ev.(type) {
+	case *kafka.Message:
+		return e.Value, nil
+
+	case kafka.Error:
+		return nil, fmt.Errorf("kafka error: %v", e)
+
+	default:
+		// Ignore other events like stats, partition assignments, etc.
+		return nil, nil
+	}
 }
